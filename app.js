@@ -72,6 +72,28 @@ function pickRecorderMime() {
   return candidates.find((t) => MediaRecorder.isTypeSupported(t)) || "";
 }
 
+// 마이크 "허용"이 풀려 팝업이 다시 뜨는 것을 막기 위해, 소리를 쓰지 않는 마이크 연결을 하나 계속 열어 둔다.
+// (iPhone은 마이크가 완전히 꺼져 있는 시간이 길면 허용 기록을 잊고 다시 묻는다.) 주소 뒤에 ?keepmic=0 을 붙이면 끈다.
+let keepStream = null;
+let keepMicOn = true;
+try {
+  const km = new URLSearchParams(location.search).get("keepmic");
+  if (km !== null) localStorage.setItem("keepmic", km === "0" ? "0" : "1");
+  if (localStorage.getItem("keepmic") === "0") keepMicOn = false;
+} catch {}
+
+function keepMicAlive(stream) {
+  if (!keepMicOn) return;
+  if (keepStream && keepStream.getTracks().some((t) => t.readyState === "live")) return;
+  keepStream = stream;
+  keepStream.getTracks().forEach((t) => (t.enabled = false)); // 연결만 유지하고 소리는 쓰지 않는다
+}
+
+function dropKeepMic() {
+  if (keepStream) keepStream.getTracks().forEach((t) => t.stop());
+  keepStream = null;
+}
+
 function releaseMic() {
   if (mediaStream) {
     mediaStream.getTracks().forEach((t) => t.stop());
@@ -145,9 +167,12 @@ async function startListening() {
   try {
     // 헤드셋/스피커에서 나오는 시험 질문을 잡는 용도라 노이즈 억제·에코 제거는 끈다
     // (둘 다 사람 목소리가 아닌 소리를 지우려 들어 인식률을 떨어뜨린다)
-    const stream = await navigator.mediaDevices.getUserMedia({
-      audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: true },
-    });
+    const audioOpts = { audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: true } };
+    // 유지용 연결이 없으면 먼저 하나 열어 둔다 (허용 팝업은 첫 한 번만 뜬다)
+    if (keepMicOn && !(keepStream && keepStream.getTracks().some((t) => t.readyState === "live"))) {
+      keepMicAlive(await navigator.mediaDevices.getUserMedia(audioOpts));
+    }
+    const stream = await navigator.mediaDevices.getUserMedia(audioOpts);
     if (session.token !== token) {
       stream.getTracks().forEach((t) => t.stop());
       return;
@@ -414,6 +439,7 @@ async function submitQuestion() {
   // 단, 미터 자체가 고장난 기기에서 영원히 막히지 않도록 연속 2번까지만 막고 그다음은 그냥 보낸다.
   if (meterRan && peak < 0.004 && session.silenceBlocks < 2) {
     session.silenceBlocks += 1;
+    dropKeepMic(); // 유지용 연결 때문에 무음이 녹음된 것일 수 있으니, 다음 시도는 예전 방식(끄고 새로 열기)으로 한다
     showError(`${ERROR_MESSAGES.no_speech} · 마이크 입력이 0이에요. 다시 [듣기]를 눌러주세요`);
     return;
   }
