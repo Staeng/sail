@@ -72,21 +72,21 @@ function pickRecorderMime() {
   return candidates.find((t) => MediaRecorder.isTypeSupported(t)) || "";
 }
 
-// 마이크 "허용"이 풀려 팝업이 다시 뜨는 것을 막기 위해, 소리를 쓰지 않는 마이크 연결을 하나 계속 열어 둔다.
-// (iPhone은 마이크가 완전히 꺼져 있는 시간이 길면 허용 기록을 잊고 다시 묻는다.) 주소 뒤에 ?keepmic=0 을 붙이면 끈다.
+// 마이크 허용 팝업이 질문마다 다시 뜨는 것을 막기 위해, 마이크 연결을 한 번만 열어서 계속 쓴다.
+// 질문마다 새로 열면 iPhone이 매번 허용을 묻는다. 예전에는 같은 연결을 재사용하면 무음이 녹음됐기 때문에,
+// 이번에는 MediaRecorder 대신 소리 데이터를 직접 받아 WAV로 만든다.
+// 주소 뒤에 ?keepmic=0 을 붙이면 예전 방식(질문마다 새로 열기)으로 돌아간다.
 let keepStream = null;
 let keepMicOn = true;
+let usePcm = true; // 무음이 녹음되면 자동으로 false가 되어 예전 방식으로 돌아간다
 try {
   const km = new URLSearchParams(location.search).get("keepmic");
   if (km !== null) localStorage.setItem("keepmic", km === "0" ? "0" : "1");
   if (localStorage.getItem("keepmic") === "0") keepMicOn = false;
 } catch {}
 
-function keepMicAlive(stream) {
-  if (!keepMicOn) return;
-  if (keepStream && keepStream.getTracks().some((t) => t.readyState === "live")) return;
-  keepStream = stream;
-  keepStream.getTracks().forEach((t) => (t.enabled = false)); // 연결만 유지하고 소리는 쓰지 않는다
+function keepStreamLive() {
+  return !!keepStream && keepStream.getTracks().some((t) => t.readyState === "live");
 }
 
 function dropKeepMic() {
@@ -94,11 +94,80 @@ function dropKeepMic() {
   keepStream = null;
 }
 
-function releaseMic() {
-  if (mediaStream) {
-    mediaStream.getTracks().forEach((t) => t.stop());
-    mediaStream = null;
+// ---- 직접 녹음 (WAV) ----
+let pcm = null;
+
+function startPcmRecording(stream) {
+  const ctx = ensureAudioCtx();
+  if (!ctx || !ctx.createScriptProcessor) return false;
+  const source = ctx.createMediaStreamSource(stream);
+  const node = ctx.createScriptProcessor(4096, 1, 1);
+  const mute = ctx.createGain();
+  mute.gain.value = 0; // 스피커로 소리가 나가지 않게
+  const parts = [];
+  node.onaudioprocess = (e) => parts.push(new Float32Array(e.inputBuffer.getChannelData(0)));
+  source.connect(node);
+  node.connect(mute);
+  mute.connect(ctx.destination);
+  pcm = { source, node, mute, parts, rate: ctx.sampleRate };
+  return true;
+}
+
+function finishPcmRecording() {
+  const r = pcm;
+  pcm = null;
+  if (!r) return new Blob([], { type: "audio/wav" });
+  try {
+    r.source.disconnect();
+    r.node.disconnect();
+    r.mute.disconnect();
+  } catch {}
+  r.node.onaudioprocess = null;
+  let total = 0;
+  for (const p of r.parts) total += p.length;
+  const all = new Float32Array(total);
+  let off = 0;
+  for (const p of r.parts) {
+    all.set(p, off);
+    off += p.length;
   }
+  // 16kHz로 줄여서 용량을 아낀다
+  const outRate = 16000;
+  const ratio = r.rate / outRate;
+  const outLen = Math.floor(all.length / ratio);
+  const pcm16 = new Int16Array(outLen);
+  for (let i = 0; i < outLen; i++) {
+    const pos = i * ratio;
+    const i0 = Math.floor(pos);
+    const frac = pos - i0;
+    const v = all[i0] * (1 - frac) + (all[i0 + 1] !== undefined ? all[i0 + 1] : all[i0]) * frac;
+    pcm16[i] = Math.max(-1, Math.min(1, v)) * 0x7fff;
+  }
+  const buf = new ArrayBuffer(44 + pcm16.length * 2);
+  const dv = new DataView(buf);
+  const w = (o, str) => [...str].forEach((c, i) => dv.setUint8(o + i, c.charCodeAt(0)));
+  w(0, "RIFF");
+  dv.setUint32(4, 36 + pcm16.length * 2, true);
+  w(8, "WAVE");
+  w(12, "fmt ");
+  dv.setUint32(16, 16, true);
+  dv.setUint16(20, 1, true);
+  dv.setUint16(22, 1, true);
+  dv.setUint32(24, outRate, true);
+  dv.setUint32(28, outRate * 2, true);
+  dv.setUint16(32, 2, true);
+  dv.setUint16(34, 16, true);
+  w(36, "data");
+  dv.setUint32(40, pcm16.length * 2, true);
+  new Int16Array(buf, 44).set(pcm16);
+  return new Blob([buf], { type: "audio/wav" });
+}
+
+function releaseMic() {
+  if (mediaStream && mediaStream !== keepStream) {
+    mediaStream.getTracks().forEach((t) => t.stop());
+  }
+  mediaStream = null;
   recorder = null;
 }
 
@@ -168,13 +237,16 @@ async function startListening() {
     // 헤드셋/스피커에서 나오는 시험 질문을 잡는 용도라 노이즈 억제·에코 제거는 끈다
     // (둘 다 사람 목소리가 아닌 소리를 지우려 들어 인식률을 떨어뜨린다)
     const audioOpts = { audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: true } };
-    // 유지용 연결이 없으면 먼저 하나 열어 둔다 (허용 팝업은 첫 한 번만 뜬다)
-    if (keepMicOn && !(keepStream && keepStream.getTracks().some((t) => t.readyState === "live"))) {
-      keepMicAlive(await navigator.mediaDevices.getUserMedia(audioOpts));
+    let stream;
+    if (keepMicOn && usePcm) {
+      // 마이크 연결을 한 번만 열고 계속 쓴다 (허용 팝업은 처음 한 번만)
+      if (!keepStreamLive()) keepStream = await navigator.mediaDevices.getUserMedia(audioOpts);
+      stream = keepStream;
+    } else {
+      stream = await navigator.mediaDevices.getUserMedia(audioOpts);
     }
-    const stream = await navigator.mediaDevices.getUserMedia(audioOpts);
     if (session.token !== token) {
-      stream.getTracks().forEach((t) => t.stop());
+      if (stream !== keepStream) stream.getTracks().forEach((t) => t.stop());
       return;
     }
     mediaStream = stream;
@@ -187,6 +259,7 @@ async function startListening() {
   }
 
   startMeter(mediaStream);
+  if (keepMicOn && usePcm && startPcmRecording(mediaStream)) return;
   chunks = [];
   const mimeType = pickRecorderMime();
   recorder = new MediaRecorder(mediaStream, {
@@ -201,6 +274,11 @@ async function startListening() {
 
 function stopListening() {
   stopMeter();
+  if (pcm) {
+    const blob = finishPcmRecording();
+    releaseMic();
+    return Promise.resolve(blob);
+  }
   return new Promise((resolve) => {
     const r = recorder;
     if (!r || r.state === "inactive") {
@@ -439,7 +517,9 @@ async function submitQuestion() {
   // 단, 미터 자체가 고장난 기기에서 영원히 막히지 않도록 연속 2번까지만 막고 그다음은 그냥 보낸다.
   if (meterRan && peak < 0.004 && session.silenceBlocks < 2) {
     session.silenceBlocks += 1;
-    dropKeepMic(); // 유지용 연결 때문에 무음이 녹음된 것일 수 있으니, 다음 시도는 예전 방식(끄고 새로 열기)으로 한다
+    // 계속 열어 둔 마이크 때문에 무음이 녹음된 것일 수 있으니, 다음 시도는 예전 방식(질문마다 새로 열기)으로 한다
+    usePcm = false;
+    dropKeepMic();
     showError(`${ERROR_MESSAGES.no_speech} · 마이크 입력이 0이에요. 다시 [듣기]를 눌러주세요`);
     return;
   }

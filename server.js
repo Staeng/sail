@@ -254,28 +254,50 @@ function looksLikeHallucination(text) {
   return HALLUCINATION_PATTERNS.some((re) => re.test(text));
 }
 
-// 최신 모델을 먼저 쓰고, 형식/모델 문제로 거부되면 가장 호환성 높은 whisper-1로 재시도.
-// 키 오류(401)나 한도 초과(429)는 재시도해도 같으므로 바로 올린다.
-// 정확도 순서로 시도: gpt-4o-transcribe -> gpt-4o-mini-transcribe -> whisper-1
+// 두 모델을 동시에 돌려서 더 많이 알아들은 쪽을 쓴다.
+// gpt-4o-transcribe는 여러 문장 질문에서 일부 문장을 통째로 빠뜨리는 일이 있고, whisper-1은 말한 것을 대체로 다 받아 적는다.
+// 병렬이라 시간은 둘 중 느린 쪽만큼만 걸린다. 키 오류(401)나 한도 초과(429)는 재시도해도 같으므로 바로 올린다.
+const wordCount = (t) => t.split(/\s+/).filter(Boolean).length;
+
 async function transcribe(audioBuffer, mimeType) {
-  const models = ["gpt-4o-transcribe", "gpt-4o-mini-transcribe", "whisper-1"];
-  let result = null;
-  let lastErr = null;
-  for (const model of models) {
+  const primary = ["gpt-4o-transcribe", "whisper-1"];
+  const settled = await Promise.allSettled(primary.map((m) => transcribeWith(m, audioBuffer, mimeType)));
+  const results = [];
+  settled.forEach((r, i) => {
+    if (r.status === "fulfilled") {
+      results.push({ ...r.value, model: primary[i] });
+    } else {
+      const err = r.reason;
+      console.warn(`${primary[i]} 실패:`, err.status, err.detail || err.message);
+    }
+  });
+
+  if (!results.length) {
+    // 둘 다 실패: 키/한도 문제면 그대로 올리고, 아니면 mini 모델로 마지막 시도
+    const fatal = settled.map((r) => r.reason).find((e) => e && (e.status === 401 || e.status === 429));
+    if (fatal) throw fatal;
     try {
-      result = await transcribeWith(model, audioBuffer, mimeType);
-      result.model = model;
-      break;
+      const r = await transcribeWith("gpt-4o-mini-transcribe", audioBuffer, mimeType);
+      results.push({ ...r, model: "gpt-4o-mini-transcribe" });
     } catch (err) {
-      if (err.status === 401 || err.status === 429) throw err;
-      lastErr = err;
-      console.warn(`${model} 실패, 다음 모델로:`, err.status, err.detail || err.message);
+      throw err;
     }
   }
-  if (!result) throw lastErr;
-  console.log(`인식 모델: ${result.model}, 확신도: ${result.confidence === null ? "n/a" : result.confidence.toFixed(2)}`);
-  if (result.confidence !== null && result.confidence < MIN_CONFIDENCE) return { text: "", confidence: result.confidence };
-  return result;
+
+  for (const r of results) {
+    const lowConf = r.confidence !== null && r.confidence < MIN_CONFIDENCE;
+    console.log(
+      `인식 [${r.model}] 단어 ${wordCount(r.text)}개, 확신도 ${r.confidence === null ? "n/a" : r.confidence.toFixed(2)}${lowConf ? " (낮음→버림)" : ""}: ${r.text}`
+    );
+    if (lowConf) r.text = "";
+  }
+
+  // 단어가 가장 많은 결과를 고른다 (같으면 앞선 모델). 환각 문구는 뒤에서 걸러진다.
+  const usable = results.filter((r) => r.text && !looksLikeHallucination(r.text));
+  const pool = usable.length ? usable : results;
+  const best = pool.reduce((a, b) => (wordCount(b.text) > wordCount(a.text) ? b : a));
+  console.log(`선택: ${best.model}`);
+  return best;
 }
 
 function confidenceLabel(c) {
