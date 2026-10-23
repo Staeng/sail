@@ -147,17 +147,17 @@ String forDisplay(const String &raw) {
   return toAscii(raw);
 }
 
-// 읽기 편한 굵은 글꼴 (U8g2의 Helvetica Bold). 큰 것부터 차례로 써 보고, 화면에 다 들어가는 가장 큰 글꼴을 고른다
+// 읽기 편한 굵은 글꼴 (U8g2의 Lucida Sans Bold: 글자 폭이 넓고 I/l/1이 구분된다). 큰 것부터 차례로 써 보고, 화면에 다 들어가는 가장 큰 글꼴을 고른다
 struct FontSpec {
   const uint8_t *font;
   int16_t lineH;    // 줄 간격(px)
   int16_t ascent;   // 줄 맨 위에서 글자 바닥선까지(px)
 };
 const FontSpec FONTS[] = {
-  {u8g2_font_helvB24_tr, 30, 24},
-  {u8g2_font_helvB18_tr, 23, 18},
-  {u8g2_font_helvB14_tr, 18, 14},
-  {u8g2_font_helvB12_tr, 16, 12},
+  {u8g2_font_luBS24_tr, 31, 24},
+  {u8g2_font_luBS18_tr, 24, 18},
+  {u8g2_font_luBS14_tr, 19, 14},
+  {u8g2_font_luBS12_tr, 16, 12},
 };
 const int FONT_COUNT = sizeof(FONTS) / sizeof(FONTS[0]);
 // 글꼴 크기를 일정하게: 0=가장 큼(24), 1=18, 2=14, 3=12. 문장이 화면에 안 들어갈 때만 자동으로 더 작아진다
