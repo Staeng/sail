@@ -154,14 +154,14 @@ struct FontSpec {
   int16_t ascent;   // 줄 맨 위에서 글자 바닥선까지(px)
 };
 const FontSpec FONTS[] = {
-  {u8g2_font_luBS24_tr, 31, 24},
-  {u8g2_font_luBS18_tr, 24, 18},
-  {u8g2_font_luBS14_tr, 19, 14},
-  {u8g2_font_luBS12_tr, 16, 12},
+  {u8g2_font_helvB18_tr, 23, 18},  // 0: 기본 (제일 또렷)
+  {u8g2_font_helvB14_tr, 18, 14},  // 1: 문장이 길어서 안 들어가면 자동으로 이 크기
+  {u8g2_font_helvB12_tr, 16, 12},  // 2
+  {u8g2_font_helvB10_tr, 13, 10},  // 3: 아주 긴 문장용
 };
 const int FONT_COUNT = sizeof(FONTS) / sizeof(FONTS[0]);
 // 글꼴 크기를 일정하게: 0=가장 큼(24), 1=18, 2=14, 3=12. 문장이 화면에 안 들어갈 때만 자동으로 더 작아진다
-const int START_FONT = 2;
+const int START_FONT = 0;
 const int16_t TEXT_LEFT = 6;
 const int16_t TEXT_WIDTH = 240 - 12;  // 좌우 여백 6px씩
 
