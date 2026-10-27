@@ -160,7 +160,7 @@ const FontSpec FONTS[] = {
   {u8g2_font_helvB10_tr, 13, 10},  // 3: 아주 긴 문장용
 };
 const int FONT_COUNT = sizeof(FONTS) / sizeof(FONTS[0]);
-// 글꼴 크기를 일정하게: 0=가장 큼(24), 1=18, 2=14, 3=12. 문장이 화면에 안 들어갈 때만 자동으로 더 작아진다
+// 글꼴 크기: 0=18(기본), 1=14, 2=12, 3=10. 문장이 한 화면에 안 들어갈 때만 자동으로 한 단계씩 작아진다
 const int START_FONT = 0;
 const int16_t TEXT_LEFT = 6;
 const int16_t TEXT_WIDTH = 240 - 12;  // 좌우 여백 6px씩
