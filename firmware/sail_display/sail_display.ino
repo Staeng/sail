@@ -286,16 +286,42 @@ void sendCommand(const char *cmd) {
   String url = String("https://") + SERVER_HOST + "/api/control";
   if (!http.begin(secureClient, url)) return;
   http.addHeader("Content-Type", "application/json");
-  http.POST(String("{\"cmd\":\"") + cmd + "\"}");
+  int code = http.POST(String("{\"cmd\":\"") + cmd + "\"}");
+  if (code <= 0) secureClient.stop();  // 연결이 깨졌으면 버리고 다음에 새로 맺는다
   http.end();
+}
+
+int pollFails = 0;       // 연속으로 실패한 횟수
+bool errShown = false;   // 화면 오른쪽 위에 오류 숫자를 띄웠는지
+
+void showPollError(int code) {
+  gfx->setFont();
+  gfx->setTextSize(1);
+  gfx->fillRect(170, 0, 56, 12, COLOR_BG);
+  gfx->setTextColor(COLOR_RED);
+  gfx->setCursor(172, 2);
+  gfx->print("ERR " + String(code));
+  errShown = true;
+}
+
+void clearPollError() {
+  if (!errShown) return;
+  gfx->fillRect(170, 0, 56, 12, COLOR_BG);
+  errShown = false;
 }
 
 void poll() {
   String url = String("https://") + SERVER_HOST + "/api/current";
-  if (!http.begin(secureClient, url)) return;
+  if (!http.begin(secureClient, url)) {
+    pollFails++;
+    secureClient.stop();
+    return;
+  }
 
   int code = http.GET();
   if (code == 200) {
+    pollFails = 0;
+    clearPollError();
     JsonDocument doc;
     if (!deserializeJson(doc, http.getString())) {
       String title = doc["title"].as<String>();
@@ -305,6 +331,16 @@ void poll() {
         lastDrawn = key;
         render(title, text);
       }
+    }
+  } else {
+    // 서버 연결이 끊겼거나 응답이 없는 경우: 연결을 버리고 새로 맺는다
+    pollFails++;
+    secureClient.stop();
+    if (pollFails >= 2) showPollError(code);
+    if (pollFails >= 6) {  // 계속 실패하면 와이파이부터 다시 붙인다
+      WiFi.disconnect();
+      WiFi.reconnect();
+      pollFails = 0;
     }
   }
   http.end();
@@ -491,6 +527,8 @@ void setup() {
   delay(1200);
 
   secureClient.setInsecure();  // 서버 인증서 검증 생략 (개인용)
+  secureClient.setTimeout(5);  // 서버가 답이 없으면 5초 뒤 포기 (화면이 멈춰 있지 않게)
+  http.setTimeout(5000);
   http.setReuse(true);         // 연결을 유지해 응답을 빠르게
 
   touchBegin();  // 터치 준비 (응답이 없어도 20ms 만에 포기하므로 버튼은 영향 없음)
