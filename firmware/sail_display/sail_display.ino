@@ -144,7 +144,8 @@ String forDisplay(const String &raw) {
   for (const Phrase &p : PHRASES) {
     if (raw.indexOf(p.ko) >= 0) return String(p.en);
   }
-  return toAscii(raw);
+  String t = toAscii(raw);
+  return t.length() ? t : String("READY");  // 보여 줄 글자가 없으면 빈 화면 대신 READY
 }
 
 // 읽기 편한 굵은 글꼴 (U8g2의 Lucida Sans Bold: 글자 폭이 넓고 I/l/1이 구분된다). 큰 것부터 차례로 써 보고, 화면에 다 들어가는 가장 큰 글꼴을 고른다

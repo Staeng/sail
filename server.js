@@ -24,7 +24,7 @@ app.use(
 
 // ---------- 두 번째 화면 (display.html / ESP32) ----------
 // 앱이 현재 보여주는 문구를 서버가 들고 있다가, 접속한 표시 기기들에 SSE로 즉시 밀어준다.
-let current = { title: "", text: "", ts: 0 };
+let current = { title: "", text: "READY", ts: 0 }; // 서버를 다시 켠 직후에도 보드/모니터가 빈 화면이 되지 않게
 const displayClients = new Set();
 const changeWaiters = new Set();
 

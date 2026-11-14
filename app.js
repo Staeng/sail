@@ -744,3 +744,4 @@ flipBtn.addEventListener("click", (e) => {
 });
 
 render();
+updateDisplay("", "READY"); // 앱을 열면 보드/모니터에 준비 상태를 알린다
