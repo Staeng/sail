@@ -421,6 +421,7 @@ app.post("/api/answer", express.raw({ type: () => true, limit: "25mb" }), async 
 
   const audio = req.body;
   if (!audio || !audio.length) return res.status(400).json({ error: "empty audio" });
+  if (audio.length < 1500) return res.status(422).json({ error: "no_speech" }); // 너무 짧아 소리가 없는 녹음
   const mimeType = String(req.headers["content-type"] || "audio/mp4").split(";")[0].trim();
   const profile = req.headers["x-profile"] ? decodeURIComponent(String(req.headers["x-profile"])) : "";
 
@@ -434,6 +435,10 @@ app.post("/api/answer", express.raw({ type: () => true, limit: "25mb" }), async 
     confidence = t.confidence;
   } catch (err) {
     console.error("음성 인식 실패:", err && err.status, err && (err.detail || err.message));
+    // 녹음 파일을 못 읽는다는 400은 사실상 소리가 없는 녹음이므로 "못 들었다"로 안내한다
+    if (err && err.status === 400 && /corrupted|unsupported/i.test(String(err.detail || ""))) {
+      return res.status(422).json({ error: "no_speech" });
+    }
     return res.status(502).json({
       error: "transcription_failed",
       status: err && err.status,

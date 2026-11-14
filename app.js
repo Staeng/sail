@@ -57,10 +57,14 @@ function updateDisplay(title, text) {
   }).catch(() => {});
 }
 
-// 사용자 터치 안에서 오디오를 열어둬야 이후 띵동이 울린다
+// 사용자 터치 안에서 오디오를 열어둬야 이후 띵동이 울리고, 직접 녹음(WAV)도 돌아간다.
+// 화면 어디든 한 번 터치하면 열린다. 보드/모니터 버튼으로만 조작하면 터치가 없어서 안 열릴 수 있다.
 function unlockOnFirstGesture() {
   ensureAudioCtx();
 }
+["pointerdown", "touchstart", "click", "keydown"].forEach((ev) =>
+  document.addEventListener(ev, unlockOnFirstGesture, { passive: true })
+);
 
 // ---------- 마이크로 질문 듣기 ----------
 let mediaStream = null;
@@ -160,7 +164,9 @@ function finishPcmRecording() {
   w(36, "data");
   dv.setUint32(40, pcm16.length * 2, true);
   new Int16Array(buf, 44).set(pcm16);
-  return new Blob([buf], { type: "audio/wav" });
+  const wav = new Blob([buf], { type: "audio/wav" });
+  wav.seconds = outLen / outRate; // 녹음된 길이(초). 0에 가까우면 소리가 안 들어온 것
+  return wav;
 }
 
 function releaseMic() {
@@ -237,8 +243,22 @@ async function startListening() {
     // 헤드셋/스피커에서 나오는 시험 질문을 잡는 용도라 노이즈 억제·에코 제거는 끈다
     // (둘 다 사람 목소리가 아닌 소리를 지우려 들어 인식률을 떨어뜨린다)
     const audioOpts = { audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: true } };
+    // 직접 녹음은 AudioContext가 "running"일 때만 소리를 받는다. 화면 터치 없이 보드 버튼으로만 시작하면 멈춰 있을 수 있어서,
+    // 잠깐 깨워 보고 안 깨면 예전 방식(MediaRecorder, 질문마다 새로 열기)으로 녹음한다.
+    let pcmNow = keepMicOn && usePcm;
+    if (pcmNow) {
+      const ctx = ensureAudioCtx();
+      if (ctx && ctx.state !== "running") {
+        try {
+          await Promise.race([ctx.resume(), new Promise((r) => setTimeout(r, 300))]);
+        } catch {}
+      }
+      pcmNow = !!ctx && ctx.state === "running" && !!ctx.createScriptProcessor;
+      if (!pcmNow) dropKeepMic();
+    }
+    session.pcmNow = pcmNow;
     let stream;
-    if (keepMicOn && usePcm) {
+    if (pcmNow) {
       // 마이크 연결을 한 번만 열고 계속 쓴다 (허용 팝업은 처음 한 번만)
       if (!keepStreamLive()) keepStream = await navigator.mediaDevices.getUserMedia(audioOpts);
       stream = keepStream;
@@ -259,7 +279,7 @@ async function startListening() {
   }
 
   startMeter(mediaStream);
-  if (keepMicOn && usePcm && startPcmRecording(mediaStream)) return;
+  if (session.pcmNow && startPcmRecording(mediaStream)) return;
   chunks = [];
   const mimeType = pickRecorderMime();
   recorder = new MediaRecorder(mediaStream, {
@@ -511,6 +531,14 @@ async function submitQuestion() {
   const meterRan = !!audioCtx && audioCtx.state === "running" && session.meterSamples >= 5;
   const blob = await stopListening();
   if (session.token !== token) return;
+
+  // 소리가 거의 안 들어온 녹음(직접 녹음이 안 돈 경우 등)은 서버로 보내지 않는다. 다음 시도는 예전 방식으로 한다.
+  if (blob.size < 1500 || (blob.seconds !== undefined && blob.seconds < 0.5)) {
+    usePcm = false;
+    dropKeepMic();
+    showError(`${ERROR_MESSAGES.no_speech} · 녹음이 안 됐어요. 폰 화면을 한 번 터치한 뒤 다시 [듣기]를 눌러주세요`);
+    return;
+  }
 
   // 레벨 미터가 정상 동작했는데 입력이 완전 0이면(iOS가 마이크를 끊은 경우) 보내지 않는다.
   // 조용한 방의 배경 소음도 이 값보다는 크므로 실제 질문을 막지는 않는다.
