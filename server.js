@@ -8,19 +8,44 @@ const express = require("express");
 const AnthropicSDK = require("@anthropic-ai/sdk");
 const path = require("path");
 const SELF_INTRO = require("./self-intro.json");
+const PROFILE = require("./profile.json");
+const { splitSentences } = require("./sentences.js");
+
+// 개인 정보는 서버에서만 들고 있다. 브라우저로 내려보내지 않는다.
+function profileSummary() {
+  return Object.entries(PROFILE)
+    .filter(([, v]) => typeof v === "string" && v.trim())
+    .map(([k, v]) => `- ${k}: ${v.trim()}`)
+    .join("\n");
+}
+const PROFILE_TEXT = profileSummary();
+
+// 예상 못한 오류 하나로 서버가 통째로 꺼지지 않게 한다 (꺼지면 현재 화면 상태도 사라진다)
+process.on("unhandledRejection", (err) => console.error("처리되지 않은 오류(Promise):", err && err.message));
+process.on("uncaughtException", (err) => console.error("처리되지 않은 오류:", err && err.message));
 
 const Anthropic = AnthropicSDK.default || AnthropicSDK;
 
 const app = express();
-app.use(express.json());
-// 앱 파일이 바뀌었는데 폰이 예전 것을 계속 쓰는 일이 없도록, 매번 서버에 새 버전이 있는지 확인하게 한다
-app.use(
-  express.static(__dirname, {
-    setHeaders: (res, filePath) => {
-      if (/\.(html|js|css|json)$/.test(filePath)) res.setHeader("Cache-Control", "no-cache");
-    },
-  })
-);
+app.disable("x-powered-by");
+app.set("trust proxy", true); // Render 같은 프록시 뒤에서도 실제 접속자 주소를 얻는다
+app.use(express.json({ limit: "20kb" }));
+
+// 브라우저에 내려줄 파일만 하나씩 공개한다. (서버 코드, 개인 정보, 펌웨어 등은 주소를 알아도 받을 수 없다.)
+// 앱 파일이 바뀌었는데 폰이 예전 것을 계속 쓰는 일이 없도록, 매번 서버에 새 버전이 있는지 확인하게 한다.
+const PUBLIC_FILES = ["index.html", "app.js", "style.css", "sw.js", "manifest.json"];
+for (const f of PUBLIC_FILES) {
+  app.get("/" + f, (req, res) => {
+    res.setHeader("Cache-Control", "no-cache");
+    res.sendFile(path.join(__dirname, f));
+  });
+}
+app.get("/", (req, res) => {
+  res.setHeader("Cache-Control", "no-cache");
+  res.sendFile(path.join(__dirname, "index.html"));
+});
+app.use("/icons", express.static(path.join(__dirname, "icons"), { dotfiles: "ignore", index: false }));
+app.get("/favicon.ico", (req, res) => res.sendFile(path.join(__dirname, "icons", "icon-192.png")));
 
 // ---------- 두 번째 화면 (display.html / ESP32) ----------
 // 앱이 현재 보여주는 문구를 서버가 들고 있다가, 접속한 표시 기기들에 SSE로 즉시 밀어준다.
@@ -30,7 +55,13 @@ const changeWaiters = new Set();
 
 function broadcastCurrent() {
   const payload = `data: ${JSON.stringify(current)}\n\n`;
-  for (const res of displayClients) res.write(payload);
+  for (const res of displayClients) {
+    try {
+      res.write(payload);
+    } catch {
+      displayClients.delete(res);
+    }
+  }
   for (const resolve of changeWaiters) resolve();
   changeWaiters.clear();
 }
@@ -74,7 +105,13 @@ function sendControl(cmd) {
     return;
   }
   pendingControl = null;
-  for (const res of controlClients) res.write(payload);
+  for (const res of controlClients) {
+    try {
+      res.write(payload);
+    } catch {
+      controlClients.delete(res);
+    }
+  }
 }
 
 app.post("/api/control", (req, res) => {
@@ -163,7 +200,8 @@ app.get("/watch", async (req, res) => {
 
 app.post("/api/current", (req, res) => {
   const { title, text } = req.body || {};
-  current = { title: String(title || ""), text: String(text || ""), ts: Date.now() };
+  // 화면에 띄우는 짧은 문구만 받는다 (너무 긴 값은 잘라서 메모리와 전송량을 지킨다)
+  current = { title: String(title || "").slice(0, 120), text: String(text || "").slice(0, 1200), ts: Date.now() };
   broadcastCurrent();
   res.json({ ok: true });
 });
@@ -292,10 +330,11 @@ async function transcribe(audioBuffer, mimeType) {
     if (lowConf) r.text = "";
   }
 
-  // 단어가 가장 많은 결과를 고른다 (같으면 앞선 모델). 환각 문구는 뒤에서 걸러진다.
+  // 기본은 더 정확한 앞선 모델(gpt-4o-transcribe)을 쓰고, 뒤 모델이 눈에 띄게(25% 넘게) 더 많이 받아 적었을 때만 그쪽을 쓴다.
+  // (앞 모델이 문장을 통째로 빠뜨린 경우를 잡기 위한 것이고, 단어 몇 개 차이로 정확도가 떨어지는 쪽을 고르지 않기 위해서다.)
   const usable = results.filter((r) => r.text && !looksLikeHallucination(r.text));
   const pool = usable.length ? usable : results;
-  const best = pool.reduce((a, b) => (wordCount(b.text) > wordCount(a.text) ? b : a));
+  const best = pool.reduce((a, b) => (wordCount(b.text) > wordCount(a.text) * 1.25 ? b : a));
   console.log(`선택: ${best.model}`);
   return best;
 }
@@ -415,7 +454,36 @@ OUTPUT FORMAT - follow exactly:
 - No numbering, no bullets, no blank lines, no quotation marks, no markdown, no filler sounds. The " / " phrase breaks are the only slashes allowed, and the "Q:" line carries none
 - Do not include internal or system XML tags in your response`;
 
-app.post("/api/answer", express.raw({ type: () => true, limit: "25mb" }), async (req, res) => {
+// 누가 주소를 알아내 이 주소를 계속 호출하면 OpenAI/Claude 요금이 나간다. 접속자별 호출 수와 동시 처리 수를 제한한다.
+const ANSWER_LIMIT_PER_MIN = 20;
+const ANSWER_MAX_CONCURRENT = 4;
+const answerCalls = new Map(); // ip -> 최근 호출 시각들
+let answersRunning = 0;
+
+function answerAllowed(ip) {
+  const now = Date.now();
+  const recent = (answerCalls.get(ip) || []).filter((t) => now - t < 60000);
+  if (recent.length >= ANSWER_LIMIT_PER_MIN || answersRunning >= ANSWER_MAX_CONCURRENT) {
+    answerCalls.set(ip, recent);
+    return false;
+  }
+  recent.push(now);
+  answerCalls.set(ip, recent);
+  return true;
+}
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, times] of answerCalls) {
+    if (!times.some((t) => now - t < 60000)) answerCalls.delete(ip);
+  }
+}, 5 * 60000).unref();
+
+app.post("/api/answer", express.raw({ type: () => true, limit: "8mb" }), async (req, res) => {
+  if (!answerAllowed(req.ip)) return res.status(429).json({ error: "rate_limited" });
+  answersRunning += 1;
+  res.on("close", () => {
+    answersRunning = Math.max(0, answersRunning - 1);
+  });
   if (!process.env.OPENAI_API_KEY) return res.status(503).json({ error: "OPENAI_API_KEY is not set" });
   if (!anthropic) return res.status(503).json({ error: "ANTHROPIC_API_KEY is not set" });
 
@@ -423,7 +491,7 @@ app.post("/api/answer", express.raw({ type: () => true, limit: "25mb" }), async 
   if (!audio || !audio.length) return res.status(400).json({ error: "empty audio" });
   if (audio.length < 1500) return res.status(422).json({ error: "no_speech" }); // 너무 짧아 소리가 없는 녹음
   const mimeType = String(req.headers["content-type"] || "audio/mp4").split(";")[0].trim();
-  const profile = req.headers["x-profile"] ? decodeURIComponent(String(req.headers["x-profile"])) : "";
+  const profile = PROFILE_TEXT;
 
   console.log(`질문 녹음 수신: ${audio.length} bytes, ${mimeType}`);
 
@@ -470,6 +538,11 @@ app.post("/api/answer", express.raw({ type: () => true, limit: "25mb" }), async 
 
   // 모델의 첫 줄: 특수 표시(SELF_INTRO / UNCLEAR)이거나 "Q: 추정한 질문"
   let firstLineSeen = false;
+  let sentencesSent = 0;
+  let clientGone = false;
+  res.on("close", () => {
+    clientGone = true; // 폰이 새 질문으로 넘어가 연결을 끊었으면 답변 생성도 멈춘다 (비용 절약)
+  });
   const writeSentence = (line) => {
     const s = line.trim();
     if (!s) return;
@@ -485,7 +558,11 @@ app.post("/api/answer", express.raw({ type: () => true, limit: "25mb" }), async 
       }
     }
     if (/^Q:\s*/i.test(s)) return; // 중간에 또 나오면 무시
-    res.write(JSON.stringify({ sentence: s }) + "\n");
+    // 모델이 문장을 한 줄에 몰아 쓰거나 문장 끝에 " /"를 붙여도 한 문장씩 보낸다
+    for (const sentence of splitSentences(s)) {
+      sentencesSent += 1;
+      res.write(JSON.stringify({ sentence }) + "\n");
+    }
   };
 
   try {
@@ -514,9 +591,16 @@ app.post("/api/answer", express.raw({ type: () => true, limit: "25mb" }), async 
       ],
     });
 
+    res.on("close", () => {
+      try {
+        stream.abort();
+      } catch {}
+    });
+
     let buffer = "";
     let special = null;
     for await (const event of stream) {
+      if (clientGone) break;
       if (event.type === "content_block_delta" && event.delta.type === "text_delta") {
         buffer += event.delta.text;
         let idx;
@@ -537,10 +621,20 @@ app.post("/api/answer", express.raw({ type: () => true, limit: "25mb" }), async 
     }
     res.write(JSON.stringify({ done: true }) + "\n");
   } catch (err) {
-    console.error("답변 생성 실패:", err && err.message);
-    res.write(JSON.stringify({ error: "generation_failed" }) + "\n");
+    if (!clientGone) {
+      console.error("답변 생성 실패:", err && err.message);
+      // 문장이 이미 몇 개 나갔다면 오류로 덮지 말고 거기까지를 답변으로 마무리한다
+      res.write(JSON.stringify(sentencesSent > 0 ? { done: true } : { error: "generation_failed" }) + "\n");
+    }
   }
   res.end();
+});
+
+// 잘못된 요청(깨진 JSON, 너무 큰 본문 등)은 서버 내부 정보가 담긴 오류 화면 대신 짧은 JSON으로 답한다
+app.use((err, req, res, next) => {
+  if (res.headersSent) return next(err);
+  const status = err && err.status >= 400 && err.status < 500 ? err.status : 500;
+  res.status(status).json({ error: status === 413 ? "too_large" : "bad_request" });
 });
 
 const PORT = process.env.PORT || 3000;

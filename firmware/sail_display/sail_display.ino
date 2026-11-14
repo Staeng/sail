@@ -541,6 +541,7 @@ void setup() {
   diagClear();
 
   connectWifi();
+  WiFi.setSleep(false);  // 와이파이 절전을 꺼서 응답이 빨라지게 한다
   diagClear();
   diagLine("WiFi OK", COLOR_GREEN);
   diagLine(WiFi.localIP().toString());
@@ -558,7 +559,7 @@ void setup() {
 void loop() {
   checkPowerButton();
   static bool touchWasDown = false;
-  static uint32_t lastTap = 0, lastTouchPoll = 0;
+  static uint32_t lastTap = 0, lastTouchPoll = 0, lastReconnect = 0;
 
   // 버튼: 기억해 둔 눌림을 처리한다 (통신 중에 눌렀어도 여기서 반드시 처리된다)
   if (nextFlag) {
@@ -589,8 +590,12 @@ void loop() {
   // 처리할 버튼이 남아 있으면 서버 확인은 잠시 미룬다
   if (!nextFlag && !listenFlag && millis() - lastPoll >= POLL_MS) {
     lastPoll = millis();
-    if (WiFi.status() == WL_CONNECTED) poll();
-    else WiFi.reconnect();
+    if (WiFi.status() == WL_CONNECTED) {
+      poll();
+    } else if (millis() - lastReconnect > 5000) {  // 끊겼을 때 5초에 한 번만 다시 붙는다 (0.6초마다 하면 오히려 못 붙는다)
+      lastReconnect = millis();
+      WiFi.reconnect();
+    }
   }
 
   if (millis() - lastBattery >= 30000) drawBattery();  // 30초마다 배터리 숫자만 갱신

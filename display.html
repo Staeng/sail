@@ -74,8 +74,12 @@
     function connect() {
       const es = new EventSource("/api/current/stream");
       es.onopen = () => { statusEl.textContent = "● 연결됨"; };
-      es.onmessage = (e) => show(JSON.parse(e.data));
-      es.onerror = () => { statusEl.textContent = "○ 재연결 중"; }; // EventSource가 자동 재연결
+      es.onmessage = (e) => { try { show(JSON.parse(e.data)); } catch {} };
+      es.onerror = () => {
+        statusEl.textContent = "○ 재연결 중";
+        // 서버가 다시 시작되는 중이면 브라우저가 연결을 아예 닫아 버린다. 그때는 직접 다시 붙는다.
+        if (es.readyState === EventSource.CLOSED) setTimeout(connect, 2000);
+      };
     }
     connect();
 

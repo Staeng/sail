@@ -1,5 +1,3 @@
-import { profileSummary } from "./profile.js";
-
 const listenZone = document.getElementById("listen-zone");
 const answerZone = document.getElementById("answer-zone");
 const listenStatus = document.getElementById("listen-status");
@@ -49,12 +47,23 @@ function playChime(onend) {
 }
 
 // ---------- 두 번째 화면 (display.html) ----------
+let displayInFlight = false;
+let displayPending = null;
+async function pumpDisplay() {
+  displayInFlight = true;
+  while (displayPending) {
+    const body = JSON.stringify(displayPending);
+    displayPending = null;
+    try {
+      await fetch("/api/current", { method: "POST", headers: { "Content-Type": "application/json" }, body });
+    } catch {}
+  }
+  displayInFlight = false;
+}
+// 연속으로 빨리 눌러도 순서가 뒤집히지 않게, 한 번에 하나씩 보내고 가장 최신 것만 남긴다
 function updateDisplay(title, text) {
-  fetch("/api/current", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ title, text }),
-  }).catch(() => {});
+  displayPending = { title, text };
+  if (!displayInFlight) pumpDisplay();
 }
 
 // 사용자 터치 안에서 오디오를 열어둬야 이후 띵동이 울리고, 직접 녹음(WAV)도 돌아간다.
@@ -101,6 +110,20 @@ function dropKeepMic() {
 // ---- 직접 녹음 (WAV) ----
 let pcm = null;
 
+// 듣기를 다시 눌러 새로 시작할 때, 끝나지 않은 직접 녹음이 남아 있으면 정리한다 (안 하면 계속 돌며 메모리를 먹는다)
+function discardPcm() {
+  if (!pcm) return;
+  try {
+    pcm.source.disconnect();
+    pcm.node.disconnect();
+    pcm.mute.disconnect();
+  } catch {}
+  pcm.node.onaudioprocess = null;
+  pcm = null;
+}
+
+const MAX_RECORD_SECONDS = 180; // 질문을 끝내지 않고 그냥 두어도 메모리가 무한히 늘지 않게 한다
+
 function startPcmRecording(stream) {
   const ctx = ensureAudioCtx();
   if (!ctx || !ctx.createScriptProcessor) return false;
@@ -109,7 +132,13 @@ function startPcmRecording(stream) {
   const mute = ctx.createGain();
   mute.gain.value = 0; // 스피커로 소리가 나가지 않게
   const parts = [];
-  node.onaudioprocess = (e) => parts.push(new Float32Array(e.inputBuffer.getChannelData(0)));
+  let samples = 0;
+  node.onaudioprocess = (e) => {
+    if (samples > ctx.sampleRate * MAX_RECORD_SECONDS) return;
+    const data = new Float32Array(e.inputBuffer.getChannelData(0));
+    samples += data.length;
+    parts.push(data);
+  };
   source.connect(node);
   node.connect(mute);
   mute.connect(ctx.destination);
@@ -224,8 +253,10 @@ const SILENCE_PEAK = 0.015;
 async function startListening() {
   // 질문마다 마이크를 새로 연다. iOS Safari는 같은 스트림으로 두 번째 녹음을 하면 무음이 녹음된다.
   stopMeter();
+  discardPcm();
   releaseMic();
   const token = ++session.token;
+  if (session.abort) session.abort.abort(); // 진행 중이던 답변 요청이 있으면 서버에서도 멈추게 끊는다
   session.phase = "LISTENING";
   session.peakLevel = 0;
   session.meterSamples = 0;
@@ -368,6 +399,8 @@ const ERROR_MESSAGES = {
   unclear: "질문을 알아듣지 못했어요 · 다시 들려주세요",
   transcription_failed: "음성 인식 서버 오류",
   generation_failed: "답변을 만들지 못했어요",
+  rate_limited: "요청이 너무 많아요 · 잠시 뒤 다시 시도하세요",
+  too_large: "녹음이 너무 길어요 · 질문이 끝나면 바로 터치하세요",
   "empty audio": "녹음된 소리가 없어요 · 마이크 권한을 확인하세요",
   "OPENAI_API_KEY is not set": "서버에 음성 인식 키가 없어요",
   "ANTHROPIC_API_KEY is not set": "서버에 Claude 키가 없어요",
@@ -517,6 +550,8 @@ function onSentencesUpdated() {
 
 async function submitQuestion() {
   const token = ++session.token;
+  const ac = new AbortController();
+  session.abort = ac;
   session.phase = "PROCESSING";
   session.sentences = [];
   session.sentenceIndex = 0;
@@ -572,11 +607,9 @@ async function submitQuestion() {
   try {
     const res = await fetch("/api/answer", {
       method: "POST",
-      headers: {
-        "Content-Type": blob.type || "audio/mp4",
-        "X-Profile": encodeURIComponent(profileSummary()),
-      },
+      headers: { "Content-Type": blob.type || "audio/mp4" },
       body: blob,
+      signal: ac.signal,
     });
     if (session.token !== token) return;
     if (!res.ok) {
@@ -613,6 +646,12 @@ async function submitQuestion() {
     onSentencesUpdated();
   } catch (err) {
     if (session.token !== token) return;
+    // 문장이 이미 나오고 있었다면 오류 화면으로 덮지 말고, 받은 데까지를 답변으로 마무리한다
+    if (session.sentences.length > 0) {
+      session.streamDone = true;
+      onSentencesUpdated();
+      return;
+    }
     showError((err && err.message) || "문제가 생겼어요");
   }
 }
@@ -696,16 +735,25 @@ let control = null;
 function connectControl() {
   if (!("EventSource" in window)) return;
   if (control && control.readyState !== EventSource.CLOSED) return;
-  control = new EventSource("/api/control/stream");
-  control.onmessage = (e) => {
+  const es = new EventSource("/api/control/stream");
+  control = es;
+  es.onmessage = (e) => {
     try {
       handleRemote(JSON.parse(e.data).cmd);
     } catch {}
+  };
+  // 서버가 다시 시작되는 중이면 브라우저가 포기하고 연결을 닫아 버린다. 잠시 뒤 직접 다시 붙는다.
+  es.onerror = () => {
+    if (es.readyState === EventSource.CLOSED && control === es) {
+      control = null;
+      setTimeout(connectControl, 2000);
+    }
   };
 }
 connectControl();
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "visible") {
+    ensureAudioCtx(); // 화면이 잠겼다 돌아오면 오디오가 멈춰 있을 수 있어서 다시 깨운다
     if (control) {
       control.close();
       control = null;
