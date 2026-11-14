@@ -427,8 +427,25 @@ void connectWifi() {
 
 // ---- 화면 터치 (BOOT 버튼과 같은 "다음") ----
 volatile uint32_t touchIntMs = 0;
+volatile bool touchFire = false;  // 새 터치가 시작됐다는 표시 (손가락을 계속 대고 있으면 다시 켜지지 않는다)
 void IRAM_ATTR onTouchInt() {
-  touchIntMs = millis();
+  uint32_t n = millis();
+  if (n - touchIntMs > 350) touchFire = true;
+  touchIntMs = n;
+}
+
+// 버튼은 눌린 순간을 "기억"해 둔다. 서버와 통신하느라 바쁜 동안 눌러도 놓치지 않게 하기 위해서다.
+volatile bool nextFlag = false, listenFlag = false;
+volatile uint32_t nextIsrMs = 0, listenIsrMs = 0;
+void IRAM_ATTR onNextBtn() {
+  uint32_t n = millis();
+  if (n - nextIsrMs > 80) nextFlag = true;  // 80ms 안에 또 들어오는 신호는 떨림이라 무시
+  nextIsrMs = n;
+}
+void IRAM_ATTR onListenBtn() {
+  uint32_t n = millis();
+  if (n - listenIsrMs > 80) listenFlag = true;
+  listenIsrMs = n;
 }
 
 String touchStatus = "";  // 부팅 화면 왼쪽 위에 보여줄 터치 상태
@@ -517,6 +534,8 @@ void setup() {
   ledcWrite(LCD_BL, BL_BRIGHTNESS);
   pinMode(BTN_START, INPUT_PULLUP);
   pinMode(BTN_LISTEN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(BTN_START), onNextBtn, FALLING);
+  attachInterrupt(digitalPinToInterrupt(BTN_LISTEN), onListenBtn, FALLING);
 
   gfx->begin();
   diagClear();
@@ -538,34 +557,37 @@ void setup() {
 
 void loop() {
   checkPowerButton();
-  static bool startWasDown = false, listenWasDown = false, touchWasDown = false;
-  static uint32_t lastTap = 0;
+  static bool touchWasDown = false;
+  static uint32_t lastTap = 0, lastTouchPoll = 0;
 
-  if (pressed(BTN_START, startWasDown)) {
+  // 버튼: 기억해 둔 눌림을 처리한다 (통신 중에 눌렀어도 여기서 반드시 처리된다)
+  if (nextFlag) {
+    nextFlag = false;
     sendCommand("next");
-    delay(150);
   }
-  if (pressed(BTN_LISTEN, listenWasDown)) {
+  if (listenFlag) {
+    listenFlag = false;
     sendCommand("listen");
-    delay(150);
   }
 
-  // 화면을 톡 치면 BOOT 버튼과 똑같이 "다음". 누르고 있어도 한 번만, 연달아 치는 것도 0.3초 간격으로만 인정
-  static uint32_t lastTouchPoll = 0;
-  if (millis() - lastTouchPoll >= 40) {  // 터치 칩은 0.04초에 한 번만 확인 (버튼 반응이 느려지지 않게)
+  // 화면 터치: BOOT 버튼과 똑같이 "다음". 인터럽트로 기억한 터치와 터치 칩 직접 확인 둘 다 쓰고, 0.4초 안의 중복은 무시
+  bool tap = touchFire;
+  touchFire = false;
+  if (millis() - lastTouchPoll >= 40) {  // 터치 칩은 0.04초에 한 번만 확인
     lastTouchPoll = millis();
     bool touchDown = touchIsDown();
-    if (touchDown && !touchWasDown && millis() - lastTap > 300) {
-      lastTap = millis();
-      gfx->fillRect(228, 0, 12, 12, COLOR_GREEN);  // 터치가 인식되면 오른쪽 위에 초록 점이 잠깐 뜬다
-      sendCommand("next");
-      delay(100);
-      gfx->fillRect(228, 0, 12, 12, COLOR_BG);
-    }
+    if (touchDown && !touchWasDown) tap = true;
     touchWasDown = touchDown;
   }
+  if (tap && millis() - lastTap > 400) {
+    lastTap = millis();
+    gfx->fillRect(228, 0, 12, 12, COLOR_GREEN);  // 터치가 인식되면 오른쪽 위에 초록 점이 잠깐 뜬다
+    sendCommand("next");
+    gfx->fillRect(228, 0, 12, 12, COLOR_BG);
+  }
 
-  if (millis() - lastPoll >= POLL_MS) {
+  // 처리할 버튼이 남아 있으면 서버 확인은 잠시 미룬다
+  if (!nextFlag && !listenFlag && millis() - lastPoll >= POLL_MS) {
     lastPoll = millis();
     if (WiFi.status() == WL_CONNECTED) poll();
     else WiFi.reconnect();
@@ -573,5 +595,5 @@ void loop() {
 
   if (millis() - lastBattery >= 30000) drawBattery();  // 30초마다 배터리 숫자만 갱신
 
-  delay(20);
+  delay(10);
 }
