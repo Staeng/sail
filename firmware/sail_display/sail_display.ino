@@ -428,24 +428,30 @@ void connectWifi() {
 // ---- 화면 터치 (BOOT 버튼과 같은 "다음") ----
 volatile uint32_t touchIntMs = 0;
 volatile bool touchFire = false;  // 새 터치가 시작됐다는 표시 (손가락을 계속 대고 있으면 다시 켜지지 않는다)
+volatile uint32_t touchFireMs = 0;
 void IRAM_ATTR onTouchInt() {
   uint32_t n = millis();
-  if (n - touchIntMs > 350) touchFire = true;
+  if (n - touchIntMs > 350) {
+    touchFire = true;
+    touchFireMs = n;
+  }
   touchIntMs = n;
 }
 
 // 버튼은 눌린 순간을 "기억"해 둔다. 서버와 통신하느라 바쁜 동안 눌러도 놓치지 않게 하기 위해서다.
 volatile bool nextFlag = false, listenFlag = false;
-volatile uint32_t nextIsrMs = 0, listenIsrMs = 0;
+// 조용하던 버튼이 "눌린" 첫 순간만 인정한다. 손을 뗄 때 접점이 떨려서 생기는 신호는 바로 앞 신호와 붙어 있어서 걸러진다
+// (이걸 안 거르면 한 번 눌렀는데 뗄 때 한 번 더 눌린 것으로 처리되어 문장이 두 개씩 넘어갈 수 있다).
+volatile uint32_t nextEdgeMs = 0, listenEdgeMs = 0;
 void IRAM_ATTR onNextBtn() {
   uint32_t n = millis();
-  if (n - nextIsrMs > 80) nextFlag = true;  // 80ms 안에 또 들어오는 신호는 떨림이라 무시
-  nextIsrMs = n;
+  if (digitalRead(BTN_START) == LOW && n - nextEdgeMs > 40) nextFlag = true;
+  nextEdgeMs = n;
 }
 void IRAM_ATTR onListenBtn() {
   uint32_t n = millis();
-  if (n - listenIsrMs > 80) listenFlag = true;
-  listenIsrMs = n;
+  if (digitalRead(BTN_LISTEN) == LOW && n - listenEdgeMs > 40) listenFlag = true;
+  listenEdgeMs = n;
 }
 
 String touchStatus = "";  // 부팅 화면 왼쪽 위에 보여줄 터치 상태
@@ -474,13 +480,18 @@ void touchBegin() {
   touchStatus = String(ok ? "touch OK" : "touch NOT FOUND") + " | i2c: " + (found.length() ? found : "none");
 }
 
-// 지금 손가락이 화면에 닿아 있는지
-bool touchIsDown() {
+// 화면에 닿아 있는 손가락 수. 터치 칩이 대답하지 않으면 -1
+int touchFingers() {
   Wire.beginTransmission(TP_ADDR);
   Wire.write(0x02);  // 손가락 개수 레지스터
-  if (Wire.endTransmission() == 0 && Wire.requestFrom((uint8_t)TP_ADDR, (uint8_t)1) == 1) {
-    if (Wire.read() > 0) return true;
-  }
+  if (Wire.endTransmission() != 0) return -1;
+  if (Wire.requestFrom((uint8_t)TP_ADDR, (uint8_t)1) != 1) return -1;
+  return Wire.read();
+}
+
+// 지금 손가락이 화면에 닿아 있는지
+bool touchIsDown() {
+  if (touchFingers() > 0) return true;
   return millis() - touchIntMs < 60;  // 방금 터치 신호가 있었어도 눌린 것으로 본다
 }
 
@@ -534,8 +545,8 @@ void setup() {
   ledcWrite(LCD_BL, BL_BRIGHTNESS);
   pinMode(BTN_START, INPUT_PULLUP);
   pinMode(BTN_LISTEN, INPUT_PULLUP);
-  attachInterrupt(digitalPinToInterrupt(BTN_START), onNextBtn, FALLING);
-  attachInterrupt(digitalPinToInterrupt(BTN_LISTEN), onListenBtn, FALLING);
+  attachInterrupt(digitalPinToInterrupt(BTN_START), onNextBtn, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(BTN_LISTEN), onListenBtn, CHANGE);
 
   gfx->begin();
   diagClear();
@@ -554,26 +565,46 @@ void setup() {
 
   touchBegin();  // 터치 준비 (응답이 없어도 20ms 만에 포기하므로 버튼은 영향 없음)
   render(touchStatus, "READY");
+
+  // 켜지는 동안 생긴 신호(터치 칩 초기화 등)는 버린다. 안 그러면 켜자마자 "다음"이 한 번 나갈 수 있다
+  touchFire = false;
+  nextFlag = false;
+  listenFlag = false;
 }
 
 void loop() {
   checkPowerButton();
-  static bool touchWasDown = false;
+  static bool startWasDown = false, listenWasDown = false, touchWasDown = false;
+  static uint32_t lastNextSent = 0, lastListenSent = 0;
   static uint32_t lastTap = 0, lastTouchPoll = 0, lastReconnect = 0;
 
-  // 버튼: 기억해 둔 눌림을 처리한다 (통신 중에 눌렀어도 여기서 반드시 처리된다)
-  if (nextFlag) {
-    nextFlag = false;
+  // 버튼: (1) 인터럽트가 기억해 둔 눌림 - 서버와 통신 중에 눌러도 놓치지 않는다
+  //       (2) 지금 눌려 있는지 직접 확인 - 인터럽트가 혹시 놓친 경우의 보험
+  // 둘이 같은 눌림을 가리킬 수 있으므로 0.25초 안의 중복은 한 번으로 친다.
+  bool nextEvt = nextFlag;
+  nextFlag = false;
+  if (pressed(BTN_START, startWasDown)) nextEvt = true;
+  if (nextEvt && millis() - lastNextSent > 250) {
     sendCommand("next");
+    lastNextSent = millis();
   }
-  if (listenFlag) {
-    listenFlag = false;
+  bool listenEvt = listenFlag;
+  listenFlag = false;
+  if (pressed(BTN_LISTEN, listenWasDown)) listenEvt = true;
+  if (listenEvt && millis() - lastListenSent > 250) {
     sendCommand("listen");
+    lastListenSent = millis();
   }
 
-  // 화면 터치: BOOT 버튼과 똑같이 "다음". 인터럽트로 기억한 터치와 터치 칩 직접 확인 둘 다 쓰고, 0.4초 안의 중복은 무시
-  bool tap = touchFire;
-  touchFire = false;
+  // 화면 터치: BOOT 버튼과 똑같이 "다음". 0.4초 안의 중복은 무시한다.
+  bool tap = false;
+  if (touchFire) {
+    uint32_t age = millis() - touchFireMs;
+    touchFire = false;
+    // 신호가 온 직후(0.15초 이내)라면 손가락이 실제로 닿아 있는지 확인해서, 손을 뗄 때 나오는 신호를 걸러낸다.
+    // 통신하느라 늦게 처리하는 경우에는 손가락이 이미 떨어졌을 수 있으므로 그대로 인정한다.
+    if (age > 150 || touchFingers() != 0) tap = true;
+  }
   if (millis() - lastTouchPoll >= 40) {  // 터치 칩은 0.04초에 한 번만 확인
     lastTouchPoll = millis();
     bool touchDown = touchIsDown();

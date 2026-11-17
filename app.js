@@ -98,8 +98,9 @@ try {
   if (localStorage.getItem("keepmic") === "0") keepMicOn = false;
 } catch {}
 
+// 화면이 잠겼다 돌아오면 아이폰이 마이크 연결을 "음소거" 상태로 남겨 둘 수 있다. 그런 연결은 죽은 것으로 보고 새로 연다.
 function keepStreamLive() {
-  return !!keepStream && keepStream.getTracks().some((t) => t.readyState === "live");
+  return !!keepStream && keepStream.getTracks().some((t) => t.readyState === "live" && !t.muted);
 }
 
 function dropKeepMic() {
@@ -291,7 +292,15 @@ async function startListening() {
     let stream;
     if (pcmNow) {
       // 마이크 연결을 한 번만 열고 계속 쓴다 (허용 팝업은 처음 한 번만)
-      if (!keepStreamLive()) keepStream = await navigator.mediaDevices.getUserMedia(audioOpts);
+      if (!keepStreamLive()) {
+        const fresh = await navigator.mediaDevices.getUserMedia(audioOpts);
+        if (keepStreamLive()) {
+          fresh.getTracks().forEach((t) => t.stop()); // 그 사이 다른 [듣기]가 먼저 열어 뒀으면 이쪽 것은 닫는다
+        } else {
+          dropKeepMic();
+          keepStream = fresh;
+        }
+      }
       stream = keepStream;
     } else {
       stream = await navigator.mediaDevices.getUserMedia(audioOpts);
@@ -321,6 +330,11 @@ async function startListening() {
     if (e.data && e.data.size) chunks.push(e.data);
   };
   recorder.start();
+  // 질문을 끝내지 않고 그냥 두어도 녹음이 끝없이 커지지 않게, 정해진 시간이 지나면 녹음만 멈춰 둔다
+  const r = recorder;
+  setTimeout(() => {
+    if (recorder === r && r.state === "recording") r.stop();
+  }, MAX_RECORD_SECONDS * 1000);
 }
 
 function stopListening() {
@@ -334,7 +348,7 @@ function stopListening() {
     const r = recorder;
     if (!r || r.state === "inactive") {
       releaseMic();
-      resolve(new Blob(chunks, { type: "audio/mp4" }));
+      resolve(new Blob(chunks, { type: (r && r.mimeType) || "audio/mp4" }));
       return;
     }
     r.onstop = () => {

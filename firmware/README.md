@@ -72,7 +72,7 @@ Arduino IDE가 우리 보드를 알아보게 만드는 작업입니다.
 1. Arduino IDE에서 **File > New Sketch** (`Ctrl` + `N`)
 2. 새 창의 코드를 **전부 지웁니다** (편집창 안을 클릭 → `Ctrl` + `A` → `Delete`)
 3. 브라우저로 아래 주소를 엽니다:
-   <https://github.com/0818soo-wq/sail/blob/claude/opic-test-answer-generator-idt0e4/firmware/sail_display/sail_display.ino>
+   <https://github.com/Staeng/sail/blob/claude/opic-test-answer-generator-idt0e4/firmware/sail_display/sail_display.ino>
 4. 코드 상자 **오른쪽 위의 복사 아이콘**(네모 두 개 겹친 모양)을 클릭하면 전체가 복사됩니다
 5. Arduino IDE 편집창을 클릭하고 `Ctrl` + `V` 로 붙여넣기
 6. **File > Save As** → 폴더는 아무데나, 파일 이름은 반드시 **`sail_display`**
